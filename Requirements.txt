@@ -1,0 +1,17 @@
+# Core scientific stack (stable versions, avoids binary mismatch)
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.3.2
+pandas==2.2.2
+
+# ML + embeddings
+torch>=2.0.0
+sentence-transformers==2.7.0
+
+# ToolUniverse SDK
+tooluniverse==1.0.4
+
+# OpenAI for GPT usage
+openai>=1.8.0
+jsonlines==3.1.0
+tqdm>=4.65.0
