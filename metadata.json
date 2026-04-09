@@ -1,0 +1,35 @@
+{
+  "meta_data": {
+    "model_name": "gpt-5-chat",
+    "track": "agentic_reasoning",
+    "model_type": "ChatGPTModel",
+    "base_model_type": "API",
+    "base_model_name": "gpt-5-chat",
+    "dataset": "cure_bench_testset_phrase_2",
+    "additional_info": "Zero-shot ChatGPT run",
+    "average_tokens_per_question": 1497.62,
+    "average_tools_per_question": 3.01,
+    "tool_category_coverage": "FDA, OpenTargets",
+    "tools_used_counts": {
+      "FDA_get_indications_by_drug_name": 6321,
+      "FDA_get_effective_time_by_drug_name": 6337,
+      "OpenTargets_search_category_counts_by_query_string": 2488,
+      "FDA_get_abuse_dependence_info_by_drug_name": 6337,
+      "FDA_get_abuse_info_by_drug_name": 6337,
+      "FDA_get_accessories_info_by_drug_name": 6337,
+      "FDA_get_active_ingredient_info_by_drug_name": 6337,
+      "FDA_get_adverse_reactions_by_drug_name": 1044,
+      "FDA_get_alarms_by_drug_name": 1051,
+      "FDA_get_animal_pharmacology_info_by_drug_name": 1051,
+      "FDA_get_assembly_installation_info_by_drug_name": 405,
+      "FDA_get_boxed_warning_info_by_drug_name": 403,
+      "FDA_get_calibration_instructions_by_drug_name": 403,
+      "FDA_get_carcinogenic_mutagenic_fertility_by_drug_name": 403,
+      "FDA_get_child_safety_info_by_drug_name": 403,
+      "FDA_get_clinical_pharmacology_by_drug_name": 402,
+      "FDA_get_clinical_studies_info_by_drug_name": 390,
+      "FDA_get_contact_for_questions_info_by_drug_name": 403,
+      "FDA_get_contraindications_by_drug_name": 403
+    }
+  }
+}
