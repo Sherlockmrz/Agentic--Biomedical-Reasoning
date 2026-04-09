@@ -5,11 +5,27 @@
 
 ---
 
+## 🔗 Links
+
+-  CURE-Bench Competition: https://www.kaggle.com/competitions/cure-bench  
+-  Conference Abstract PDF:  
+  https://midi2025.opi.org.pl/wp-content/uploads/2025/12/Plan-Act-Verify-An-Agentic-AI-Question-Answering-and-Reasoning-System-Evaluated-on-the-CURE-Bench-Challenge.pdf  
+-  MIDI 2025 Virtual Venue:  
+  https://midi2025.opi.org.pl/vr-venue/  
+
+---
+
 ##  Overview
 
 This repository presents **Plan–Act–Verify**, a two-pass agentic system for **therapeutic reasoning** on the **CURE-Bench** benchmark.
 
 The system integrates large language models with curated biomedical tools to improve factual grounding, reduce hallucination, and support structured clinical decision-making.
+
+---
+
+##  Paper Preview
+
+![Paper Preview](assets/paper_preview.png)
 
 ---
 
@@ -36,7 +52,13 @@ The system integrates large language models with curated biomedical tools to imp
 - Retrieve structured evidence  
 - Filter, deduplicate, and compress into **Tool Facts**  
 - Feed evidence back into the model  
-- Generate final answer  
+- Generate final answer
+
+---
+
+## 🖼️ Pipeline Overview
+
+![Pipeline](assets/pipeline.png)
 
 ---
 
@@ -78,6 +100,31 @@ The system uses a curated subset of high-value biomedical tools:
 3. Tools retrieve evidence (FDA, DailyMed, etc.)  
 4. Evidence is summarized into **Tool Facts**  
 5. Model outputs final answer  
+
+---
+
+## 🏗️ Project Structure
+
+    .
+    ├── src/
+    │   └── pipeline_implementation.py
+    ├── outputs/
+    │   ├── metadata.json
+    │   ├── submission_m.csv
+    │   └── submission_m.csv.zip
+    ├── assets/
+    │   ├── paper_preview.png
+    │   └── pipeline.png
+    ├── README.md
+    └── requirements.txt
+
+---
+
+## 🚀 Quick Start
+
+    pip install -r requirements.txt
+    export OPENROUTER_API_KEY=your_key_here
+    python src/pipeline_implementation.py
 
 ---
 
