@@ -102,7 +102,7 @@ def _get_env(name: str, default: str = "") -> str:
 
 OPENROUTER_API_KEY = _get_env(
     "OPENROUTER_API_KEY",
-    "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"  # your provided key
+    "***"  # your provided key
 )
 if not OPENROUTER_API_KEY:
     raise RuntimeError("Missing OPENROUTER_API_KEY in environment!")
