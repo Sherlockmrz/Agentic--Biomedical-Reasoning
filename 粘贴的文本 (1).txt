@@ -1,0 +1,937 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+CURE-Bench – Agentic submission with ToolUniverse + OpenRouter GPT-5 (PyCharm)
+Two-pass flow:
+  Pass-1  (planning): send STEM + OPTIONS to GPT-5 to pick keywords, facts_needed, and tools.
+  Tooling (agent):    call only high-success tools; collect FULL tool facts; then cap & curate.
+  Pass-2  (answer):   give GPT-5: prior analysis + **curated 10 tool facts** + full question+options,
+                      and require 'Final answer: X' (single letter).
+
+Outputs:
+  outputs/submission.csv, outputs/metadata.json, outputs/cure_bench_gpt5_...zip
+"""
+
+from __future__ import annotations
+import os, sys, json, re, ast, difflib, zipfile
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Tuple
+
+import jsonlines
+import pandas as pd
+from tqdm import tqdm
+
+# ====== Verbose toggle for prints (keep only the 4 requested prints + tqdm) ======
+VERBOSE = False
+def _log(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
+
+# ========== OpenRouter (OpenAI client) ==========
+from openai import OpenAI
+
+# ========== ToolUniverse (light entry path first; fallback to full) ==========
+# shim for old transformers import paths that some SDKs expect
+def _patch_transformers_generation():
+    try:
+        import sys as _sys, types as _types
+        try:
+            from transformers.generation.utils import GenerationMixin as _GenMixin  # type: ignore
+        except Exception:
+            from transformers.generation import GenerationMixin as _GenMixin  # type: ignore
+        if "transformers.generation" not in _sys.modules:
+            mod = _types.ModuleType("transformers.generation")
+            mod.GenerationMixin = _GenMixin
+            _sys.modules["transformers.generation"] = mod
+            _log("[DEBUG] Applied transformers GenerationMixin shim")
+    except Exception as e:
+        _log("[DEBUG] GenerationMixin shim failed:", e)
+
+_patch_transformers_generation()
+
+try:
+    from tooluniverse.execute_function import ToolUniverse
+    _TOOLUNIVERSE_AVAILABLE = True
+except Exception as _e:
+    _log(f"[ToolUniverse] Could not import SDK: {_e}")
+    try:
+        from tooluniverse import ToolUniverse  # fallback
+        _TOOLUNIVERSE_AVAILABLE = True
+    except Exception as _e2:
+        _log(f"[ToolUniverse] Fallback import failed: {_e2}")
+        _TOOLUNIVERSE_AVAILABLE = False
+
+
+# ------------------ project paths & dataset location ------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_ROOT = PROJECT_ROOT / "data"
+OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+FILENAME = "curebench_testset_phase1.jsonl"
+
+def locate_testset(filename: str = FILENAME) -> Path:
+    """Find testset locally (handles 'cure-bench' vs 'cure bench' folders)."""
+    env_path = os.environ.get("CURE_TESTSET")
+    if env_path:
+        p = Path(env_path).expanduser().resolve()
+        if p.is_file():
+            return p
+        raise FileNotFoundError(f"CURE_TESTSET points to non-file: {p}")
+
+    candidates = [
+        DATA_ROOT / "cure-bench" / filename,
+        DATA_ROOT / "cure bench" / filename,
+    ]
+    if not any(p.exists() for p in candidates) and DATA_ROOT.exists():
+        for p in DATA_ROOT.rglob(filename):
+            candidates.append(p)
+
+    for p in candidates:
+        if p.exists():
+            return p
+    tried = "\n  - " + "\n  - ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"Could not find {filename}. Tried:{tried}")
+
+
+# ------------------ OpenRouter config (GPT-5) ------------------
+def _get_env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default)
+
+OPENROUTER_API_KEY = _get_env(
+    "OPENROUTER_API_KEY",
+    "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"  # your provided key
+)
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("Missing OPENROUTER_API_KEY in environment!")
+
+# mirror to OPENAI_* vars for libs that read them
+os.environ.setdefault("OPENAI_API_KEY", OPENROUTER_API_KEY)
+os.environ.setdefault("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+    default_headers={
+        "HTTP-Referer": "https://pycharm.local/",
+        "X-Title": "CURE-Bench-Submission",
+    },
+)
+OR_MODEL_ID = "openai/gpt-5-chat"
+
+
+# ------------------ tiny helpers ------------------
+def pretty(obj: Any, n: int | None = None) -> str:
+    try:
+        s = json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        s = str(obj)
+    if n is None or len(s) <= n:
+        return s
+    return s[:n] + " …"
+
+def options_block(options) -> str:
+    if not options:
+        return ""
+    if isinstance(options, dict):
+        return "\n" + "\n".join([f"{k}: {v}" for k, v in options.items()]) + "\n"
+    return "\n" + "\n".join([f"{chr(65+i)}: {o}" for i, o in enumerate(options)]) + "\n"
+
+def extract_json_block(text: str) -> dict:
+    try:
+        m = re.search(r"\{.*\}", text or "", flags=re.S)
+        if m:
+            return json.loads(m.group(0))
+    except Exception:
+        pass
+    try:
+        return json.loads(text)
+    except Exception:
+        try:
+            obj = ast.literal_eval((text or "").strip())
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return {}
+
+# ---- fact clipping & selection helpers (NEW) ----
+MAX_FACT_CHARS = 630  # per-fact cap
+
+def _clip(txt: Any, n: int = MAX_FACT_CHARS) -> str:
+    if txt is None:
+        return ""
+    s = " ".join(str(txt).split())
+    return s if len(s) <= n else s[:n].rstrip() + " …"
+
+def _tool_family(name: str) -> str:
+    n = (name or "").lower()
+    if "fda_" in n: return "FDA"
+    if "medline" in n: return "MedlinePlus"
+    if "dailymed" in n: return "DailyMed"
+    if "rxnav" in n or "rxnorm" in n: return "RxNav/RxNorm"
+    if "opentarget" in n: return "OpenTargets"
+    if "pubchem" in n: return "PubChem"
+    return "Other"
+
+def _parse_tool_from_line(line: str) -> str:
+    m = re.search(r"\[([^\]]+)\]", line or "")
+    return (m.group(1).strip() if m else "")
+
+def select_success_facts_for_model(facts_text: str, max_tools: int = 10) -> Tuple[str, int, List[str]]:
+    """
+    Keep at most `max_tools` fact lines with family diversity and clip long ones.
+    Return (joined_facts, count, families_used_ordered_unique).
+    """
+    # only lines that look like "- XXX"
+    lines = [ln for ln in (facts_text or "").splitlines() if ln.strip().startswith("-")]
+    # hard filter: drop any line that contains ': None' or "error"
+    lines = [ln for ln in lines if not re.search(r":\s*None\b", ln, flags=re.I)]
+    lines = [ln for ln in lines if "error" not in ln.lower()]
+
+    parsed = []
+    for ln in lines:
+        tool = _parse_tool_from_line(ln)
+        fam = _tool_family(tool)
+        parsed.append((fam, tool, ln))
+    # bucket by family
+    families: Dict[str, List[Tuple[str, str]]] = {}
+    for fam, tool, ln in parsed:
+        families.setdefault(fam, []).append((tool, ln))
+    order = ["FDA","MedlinePlus","DailyMed","RxNav/RxNorm","OpenTargets","PubChem","Other"]
+    chosen: List[str] = []
+    fams_used: List[str] = []
+    while len(chosen) < max_tools:
+        added = 0
+        for fam in order:
+            if families.get(fam):
+                tool, ln = families[fam].pop(0)
+                clipped = _clip(ln)
+                chosen.append(clipped)
+                if fam not in fams_used:
+                    fams_used.append(fam)
+                added += 1
+                if len(chosen) >= max_tools:
+                    break
+        if added == 0:
+            break
+    return ("\n".join(chosen), len(chosen), fams_used)
+
+
+# -------- helpers to robustly detect empty/None payloads ----------
+def _strip_tool_tag(s: str) -> str:
+    """Remove leading '[ToolName] ' tag if present."""
+    return re.sub(r"^\[[^\]]+\]\s*", "", (s or "").strip())
+
+def _json_or_none(s: str) -> Any:
+    """Try to parse the *actual* payload; return None for None/null/empty."""
+    if not s:
+        return None
+    st = _strip_tool_tag(s)
+    if st.lower() in {"none", "null", ""}:
+        return None
+    # try to extract a JSON object/array inside the payload
+    m = re.search(r"(\{.*\}|\[.*\])", st, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # fallback: try whole string
+    try:
+        return json.loads(st)
+    except Exception:
+        return st  # raw non-JSON string
+
+def _has_nonempty_recent_changes(obj: Any) -> bool:
+    try:
+        for r in (obj.get("results") or []):
+            arr = r.get("recent_major_changes")
+            if isinstance(arr, list) and any((str(x).strip() for x in arr)):
+                return True
+    except Exception:
+        pass
+    return False
+
+def _has_nonempty_results(obj: Any) -> bool:
+    try:
+        res = obj.get("results")
+        return isinstance(res, list) and len(res) > 0
+    except Exception:
+        return False
+
+def _ot_total(obj: Any) -> int:
+    try:
+        return int(obj["data"]["search"]["aggregations"]["total"])
+    except Exception:
+        return 0
+
+def _is_useful_payload(tool_name: str, payload_str: str) -> bool:
+    """Return True iff payload contains concrete, non-empty facts."""
+    if not payload_str:
+        return False
+    cleaned = _strip_tool_tag(payload_str)
+    if re.match(r"^(none|null)\s*$", cleaned, flags=re.I):
+        return False
+    low = cleaned.lower()
+    if '"error"' in low:
+        return False
+    obj = _json_or_none(cleaned)
+    if obj is None:
+        return False
+    # Non-JSON stray strings are only useful if they aren't trivial
+    if isinstance(obj, str):
+        return len(obj.strip()) > 10
+
+    # JSON-specific checks
+    t = (tool_name or "").lower()
+    if "opentargets_search_category_counts_by_query_string" in t:
+        return _ot_total(obj) > 0
+    if "recent_changes" in t:
+        return _has_nonempty_recent_changes(obj)
+    # generic (FDA/DailyMed etc.)
+    return _has_nonempty_results(obj)
+
+
+# -------------- candidate cleaning for by_drug_name tools (avoid sentence-like) --------------
+def _is_sentence_like(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t[:3].lower() == "to ":
+        return True
+    if len(t.split()) >= 6:
+        return True
+    if re.search(r"\b(study|assess|evaluate|determine|with|due to|contraindicated|for the|effect of)\b", t, flags=re.I):
+        return True
+    if any(ch in t for ch in [":", ";", "?", "!", "."]):
+        return True
+    return False
+
+def _drug_like(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _is_sentence_like(t):
+        return False
+    if re.search(r"^\d", t):
+        return False
+    return len(t.split()) <= 3
+
+
+# ------------------ GPT-5 wrapper ------------------
+class GPT5Model:
+    def __init__(self, model_id: str = OR_MODEL_ID):
+        self.model_id = model_id
+        self._token_totals: List[int] = []
+
+    def chat(self, messages, max_tokens=800, temperature=0.2) -> str:
+        try:
+            resp = client.chat.completions.create(
+                model=self.model_id,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=0.95,
+            )
+            try:
+                if getattr(resp, "usage", None) and getattr(resp.usage, "total_tokens", None) is not None:
+                    self._token_totals.append(int(resp.usage.total_tokens))
+            except Exception:
+                pass
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            _log("[DEBUG] chat error:", e)
+            return ""
+
+    # PASS-1 (planning)
+    def plan(self, stem: str, options) -> dict:
+        system = (
+            "You are a biomedical tool planner. Output ONLY JSON. "
+            "Goal: decide what facts are needed and what tools to call from ToolUniverse."
+        )
+
+        instruction = """
+Return STRICT JSON only. Schema:
+{
+  "notes": string,
+  "keywords": string[],
+  "keyword_types": {string:string},
+  "facts_needed": ["indications","moa","dosing","warnings","contra","interactions","pediatric","pregnancy","lactation","renal","hepatic","ingredient"],
+  "tools": string[],
+  "arg_templates": {string: object}
+}
+Rules:
+- Infer from STEM and OPTIONS.
+- Prefer FDA_by_drug_name, MedlinePlus(drugs), DailyMed_by_drug, RxNav/RxNorm_by_drug, OpenTargets_search, PubChem_by_name.
+- Include at least 5 distinct tool families.
+- No Tool_Finder/LLM/Embedding, and avoid *_by_set_id / *_by_reference / *_by_SPL_ID / *search_spls* / *index* tools.
+"""
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",
+             "content": f"{instruction}\n\nSTEM:\n{stem.strip()}\n\nOPTIONS:\n{options_block(options)}"}
+        ]
+        raw = self.chat(messages, max_tokens=900, temperature=0.1)
+        plan = extract_json_block(raw)
+        plan.setdefault("notes", "")
+        plan.setdefault("keywords", [])
+        plan.setdefault("keyword_types", {})
+        plan.setdefault("facts_needed", [])
+        plan.setdefault("tools", [])
+        plan.setdefault("arg_templates", {})
+        return plan
+
+    def build_pass2_prompt(self, question: str, options, ai_plan: dict, tool_facts: str) -> str:
+        parts = []
+        if ai_plan.get("notes"):
+            parts.append("Notes: " + ai_plan["notes"])
+        if ai_plan.get("keywords"):
+            parts.append("Keywords: " + ", ".join(ai_plan["keywords"]))
+        if ai_plan.get("facts_needed"):
+            parts.append("Facts needed: " + ", ".join(map(str, ai_plan["facts_needed"])))
+        if ai_plan.get("keyword_types"):
+            kt = ", ".join([f"{k}:{v}" for k, v in (ai_plan["keyword_types"] or {}).items()])
+            if kt:
+                parts.append("Keyword types: " + kt)
+
+        info = "\n".join(parts)
+
+        analysis_block = ("PRIOR ANALYSIS\n" + info + "\n\n") if info else ""
+        facts_block = ("TOOL FACTS\n" + tool_facts + "\n\n") if tool_facts else ""
+        question_block = "Question: " + question.strip() + "\n"
+        options_block_text = options_block(options)
+
+        return (
+            "You are a biomedical expert.\n"
+            "Use the TOOL FACTS together with the analysis to answer the MCQ.\n"
+            "Output ONLY one line: 'Final answer: X' where X is A,B,C, or D.\n\n"
+            + analysis_block
+            + facts_block
+            + question_block
+            + options_block_text
+        )
+
+    def avg_tokens_per_question(self, num_questions: int) -> float:
+        if num_questions <= 0:
+            return 0.0
+        total = sum(self._token_totals)
+        return float(total) / float(num_questions)
+
+
+# ------------------ ToolUniverse agent ------------------
+class ToolAgent:
+    """
+    Use a diversified set of reliable tools:
+      ✅ FDA_* by_drug_name, MedlinePlus_search_topics_by_keyword,
+         DailyMed_get_label_by_drug_name,
+         RxNav_get_rxcui_by_drug_name, RxNav_get_interactions_by_rxcui,
+         OpenTargets_search_category_counts_by_query_string,
+         PubChem_get_compound_summary_by_name
+      🚫 Avoid *_by_set_id / *_by_reference / *_by_SPL_ID / *search_spls* / *index* / ToolMetadataGenerationPipeline / get_xarray_info / *LLM*.
+    """
+
+    GOOD_SUBSTRINGS = [
+        # FDA family
+        "fda_get_effective_time_by_drug_name",
+        "fda_get_indications_by_drug_name",
+        "fda_get_warnings_and_cautions_by_drug_name",
+        # MedlinePlus
+        "medlineplus_search_topics_by_keyword",
+        # DailyMed
+        "dailymed_get_label_by_drug_name",
+        # RxNav / RxNorm
+        "rxnav_get_rxcui_by_drug_name",
+        "rxnav_get_interactions_by_rxcui",
+        "rxnorm",
+        # OpenTargets
+        "opentargets_search_category_counts_by_query_string",
+        # PubChem
+        "pubchem_get_compound_summary_by_name",
+    ]
+    AVOID_SUBSTRINGS = [
+        "by_set_id", "by_reference", "by_spl_id",
+        "search_spls", "genetics_index", "indexing", "index",
+        "toolmetadatagenerationpipeline", "get_xarray_info",
+        "finder", "embedding", "llm"
+    ]
+
+    # keep failures low
+    MAX_TOOL_RUNS = 20
+
+    # ---- NEW: suppress noisy stdout/stderr/logging during tool calls ----
+    import contextlib, io, logging, warnings
+    @contextlib.contextmanager
+    def _suppress_external_output(self):
+        import contextlib as _cl, io as _io, logging as _logging, warnings as _warnings
+        # temporarily silence common loggers
+        logger_names = ["", "urllib3", "requests", "httpx", "tooluniverse", "openai", "transformers"]
+        loggers = [_logging.getLogger(n) for n in logger_names]
+        levels = [lg.level for lg in loggers]
+        for lg in loggers:
+            lg.setLevel(_logging.CRITICAL + 1)
+            lg.propagate = False
+        # silence warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            # redirect stdout/stderr to devnull
+            with open(os.devnull, "w") as devnull:
+                with _cl.redirect_stdout(devnull), _cl.redirect_stderr(devnull):
+                    yield
+        # restore logger levels
+        for lg, lvl in zip(loggers, levels):
+            lg.setLevel(lvl)
+
+    def __init__(self):
+        self.ok = _TOOLUNIVERSE_AVAILABLE
+        self.tu = None
+        self.names: List[str] = []
+        self.descs: List[str] = []
+        self.ban: set[str] = set()
+
+        if self.ok:
+            try:
+                self.tu = ToolUniverse()
+                self.tu.load_tools()
+                try:
+                    self.names, self.descs = self.tu.refresh_tool_name_desc()
+                except Exception:
+                    self.names, self.descs = [], []
+                _log(f"ℹ️  Number of tools after load tools: {len(self.names) or 'unknown'}")
+            except Exception as e:
+                _log("[ToolUniverse] init failed:", e)
+                self.ok = False
+
+    def _allowed(self, name: str) -> bool:
+        n = (name or "").lower()
+        if name in self.ban:
+            return False
+        if any(bad in n for bad in self.AVOID_SUBSTRINGS):
+            return False
+        if any(good in n for n in self.GOOD_SUBSTRINGS for good in [n]):
+            return True
+        if any(good in n for good in self.GOOD_SUBSTRINGS):
+            return True
+        return False
+
+    def catalog(self) -> List[str]:
+        return [n for n in self.names if self._allowed(n)]
+
+    @staticmethod
+    def _option_drugs(options) -> List[str]:
+        def clean(x: str) -> str:
+            x = re.split(r"[,(/)]", x)[0]
+            x = re.sub(r"\b\d+(\.\d+)?\s*(mg|mcg|g|%)\b.*$", "", x, flags=re.I)
+            return x.strip()
+        drugs = []
+        if isinstance(options, dict):
+            vals = list(options.values())
+        elif isinstance(options, list):
+            vals = [str(o) for o in options]
+        else:
+            vals = []
+        for v in vals:
+            cand = clean(str(v))
+            if re.search(r"[A-Za-z]{3,}", cand) and cand.lower() not in {"none of the above"}:
+                if _drug_like(cand):
+                    drugs.append(cand)
+        # de-dup preserve order
+        seen = set(); out = []
+        for d in drugs:
+            if d.lower() not in seen:
+                seen.add(d.lower())
+                out.append(d)
+        return out
+
+    def _run(self, tool_name: str, **kwargs) -> Tuple[bool, str]:
+        """Return (ok, FULL_STRING_PAYLOAD). Never raises."""
+        if not self.ok or not tool_name:
+            return False, ""
+        try:
+            # suppress noisy prints/logging just for the tool call
+            with self._suppress_external_output():
+                res = self.tu.run_one_function({"name": tool_name, "arguments": kwargs})
+        except Exception as e:
+            msg = str(e)
+            if ("not found in registry" in msg) or ("transformers" in msg.lower()):
+                self.ban.add(tool_name)
+            return False, f"[{tool_name}] error: {e}"
+
+        # stringify FULL payload
+        if isinstance(res, (dict, list)):
+            try:
+                payload = json.dumps(res, ensure_ascii=False, indent=None)
+            except Exception:
+                payload = str(res)
+        else:
+            payload = str(res)
+
+        low = payload.lower()
+        if ("invalid function call" in low) or ("error" in low) or ("not found in loaded tools" in low):
+            return False, f"[{tool_name}] {payload}"
+
+        return True, f"[{tool_name}] {payload}"
+
+    def collect(self, question: str, options, plan: dict) -> Tuple[str, List[dict]]:
+        if not self.ok:
+            return "", []
+
+        keywords = list(dict.fromkeys([k for k in (plan.get("keywords") or []) if isinstance(k, str) and k.strip()]))
+        suggested = plan.get("tools") or []
+
+        # build tool list
+        pool = []
+        names_lc = [n.lower() for n in self.names]
+        for s in suggested:
+            s_l = (s or "").lower().strip()
+            if not s_l:
+                continue
+            for i, nn in enumerate(names_lc):
+                if s_l in nn and self._allowed(self.names[i]):
+                    pool.append(self.names[i])
+            for m in difflib.get_close_matches(s_l, names_lc, n=5, cutoff=0.4):
+                name = self.names[names_lc.index(m)]
+                if self._allowed(name):
+                    pool.append(name)
+        for n in self.catalog():
+            if n not in pool:
+                pool.append(n)
+
+        # uniqueness
+        seen = set(); selected = []
+        for n in pool:
+            if n not in seen:
+                seen.add(n)
+                selected.append(n)
+
+        # reorder by success preference
+        preferred = [
+            "fda_get_indications_by_drug_name",
+            "fda_get_effective_time_by_drug_name",
+            "dailymed_get_label_by_drug_name",
+            "medlineplus_search_topics_by_keyword",
+            "rxnav_get_rxcui_by_drug_name",
+            "rxnav_get_interactions_by_rxcui",
+            "opentargets_search_category_counts_by_query_string",
+            "pubchem_get_compound_summary_by_name",
+        ]
+        def sort_key(name: str) -> Tuple[int, str]:
+            n = name.lower()
+            for i, p in enumerate(preferred):
+                if p in n:
+                    return (i, n)
+            return (len(preferred)+1, n)
+        selected.sort(key=sort_key)
+
+        tool_trace: List[dict] = [{"role": "system", "content": "SELECTED_TOOLS: " + ", ".join(selected)}]
+        facts: List[str] = []
+
+        drugs = self._option_drugs(options)
+        rxcui_map: Dict[str, str] = {}
+        runs = 0
+
+        for tname in selected:
+            if runs >= self.MAX_TOOL_RUNS:
+                break
+            lname = tname.lower()
+            if any(bad in lname for bad in self.AVOID_SUBSTRINGS):
+                continue
+
+            # (A) by_drug_name endpoints
+            if "by_drug_name" in lname and ("fda_" in lname or "dailymed_" in lname or "rxnav_get_rxcui_by_drug_name" in lname):
+                for d in drugs[:3] or keywords[:3]:
+                    if _is_sentence_like(d):
+                        continue
+                    if "rxnav_get_rxcui_by_drug_name" in lname:
+                        ok, out = self._run(tname, drug_name=d); runs += 1
+                        content = f"args={{'drug_name':'{d}'}} | {'OK' if ok else 'FAILED'} | {out}"
+                        tool_trace.append({"role": "tool", "name": tname, "content": content})
+                        if ok and _is_useful_payload(tname, out):
+                            facts.append(f"- RXN) {d}: {out}")
+                            m = re.search(r'"rxcui"\s*:\s*"?(?P<id>\d+)"?', out)
+                            if m:
+                                rxcui_map[d] = m.group("id")
+                        if runs >= self.MAX_TOOL_RUNS:
+                            break
+                        continue
+
+                    ok, out = self._run(tname, drug_name=d); runs += 1
+                    content = f"args={{'drug_name':'{d}'}} | {'OK' if ok else 'FAILED'} | {out}"
+                    tool_trace.append({"role": "tool", "name": tname, "content": content})
+                    if ok and _is_useful_payload(tname, out):
+                        prefix = "FDA" if "fda_" in lname else "DM"
+                        facts.append(f"- {prefix}) {d}: {out}")
+                    if runs >= self.MAX_TOOL_RUNS:
+                        break
+                continue
+
+            # (B) RxNav interactions
+            if "rxnav_get_interactions_by_rxcui" in lname:
+                if not rxcui_map and drugs:
+                    try_tool = next((nm for nm in selected if "rxnav_get_rxcui_by_drug_name" in nm.lower()), "")
+                    for d in drugs[:2]:
+                        if runs >= self.MAX_TOOL_RUNS or not try_tool:
+                            break
+                        ok0, out0 = self._run(try_tool, drug_name=d); runs += 1
+                        tool_trace.append({"role": "tool", "name": try_tool,
+                                           "content": f"args={{'drug_name':'{d}'}} | {'OK' if ok0 else 'FAILED'} | {out0}"})
+                        if ok0 and _is_useful_payload(try_tool, out0):
+                            m0 = re.search(r'"rxcui"\s*:\s*"?(?P<id>\d+)"?', out0)
+                            if m0:
+                                rxcui_map[d] = m0.group("id")
+                for d, rxcui in list(rxcui_map.items())[:2]:
+                    if runs >= self.MAX_TOOL_RUNS:
+                        break
+                    ok, out = self._run(tname, rxcui=rxcui); runs += 1
+                    tool_trace.append({"role": "tool", "name": tname,
+                                       "content": f"args={{'rxcui':'{rxcui}'}} | {'OK' if ok else 'FAILED'} | {out}"})
+                    if ok and _is_useful_payload(tname, out):
+                        facts.append(f"- RXI) {d}/RXCUI={rxcui}: {out}")
+                continue
+
+            # (C) MedlinePlus — only try once to cut failures
+            if "medlineplus_search_topics_by_keyword" in lname:
+                tried_terms = [t for t in (drugs[:1] or keywords[:1]) if not _is_sentence_like(t)]
+                for term in tried_terms[:1]:
+                    if runs >= self.MAX_TOOL_RUNS:
+                        break
+                    ok, out = self._run(tname, term=term, db="drugs", rettype="topic"); runs += 1
+                    content = f"args={{'term':'{term}','db':'drugs','rettype':'topic'}} | {'OK' if ok else 'FAILED'} | {out}"
+                    tool_trace.append({"role": "tool", "name": tname, "content": content})
+                    if ok and _is_useful_payload(tname, out):
+                        facts.append(f"- MP) {term}: {out}")
+                continue
+
+            # (D) OpenTargets
+            if "opentargets_search_category_counts_by_query_string" in lname:
+                term = None
+                if drugs: term = drugs[0]
+                elif keywords: term = keywords[0]
+                if term and not _is_sentence_like(term):
+                    if runs >= self.MAX_TOOL_RUNS:
+                        continue
+                    ok, out = self._run(tname, queryString=term); runs += 1
+                    tool_trace.append({"role": "tool", "name": tname,
+                                       "content": f"args={{'queryString':'{term}'}} | {'OK' if ok else 'FAILED'} | {out}"})
+                    if ok and _is_useful_payload(tname, out):
+                        facts.append(f"- OT) {term}: {out}")
+                continue
+
+            # (E) PubChem
+            if "pubchem_get_compound_summary_by_name" in lname:
+                for d in [x for x in drugs[:2] if not _is_sentence_like(x)]:
+                    if runs >= self.MAX_TOOL_RUNS:
+                        break
+                    ok, out = self._run(tname, name=d); runs += 1
+                    tool_trace.append({"role": "tool", "name": tname,
+                                       "content": f"args={{'name':'{d}'}} | {'OK' if ok else 'FAILED'} | {out}"})
+                    if ok and _is_useful_payload(tname, out):
+                        facts.append(f"- PC) {d}: {out}")
+                        break
+                continue
+
+        return "\n".join(facts), tool_trace
+
+
+# ------------------ pipeline functions ------------------
+def load_questions(path: Path, limit: int | None = None) -> List[dict]:
+    data = []
+    with jsonlines.open(path) as reader:
+        for obj in reader:
+            data.append(obj)
+            if limit and len(data) >= limit:
+                break
+    return data
+
+# ---- incremental checkpointing (append-every-question) ----
+CHECKPOINT_JSONL = OUTPUT_ROOT / "submission_checkpoint.jsonl"
+
+def load_done_ids_from_checkpoint() -> set:
+    done = set()
+    if CHECKPOINT_JSONL.exists():
+        with jsonlines.open(CHECKPOINT_JSONL) as r:
+            for obj in r:
+                _id = str(obj.get("id", ""))
+                if _id:
+                    done.add(_id)
+    return done
+
+def load_rows_from_checkpoint() -> List[dict]:
+    rows = []
+    if CHECKPOINT_JSONL.exists():
+        with jsonlines.open(CHECKPOINT_JSONL) as r:
+            for obj in r:
+                try:
+                    rows.append({
+                        "id": obj.get("id","NOTAVALUE"),
+                        "prediction": obj.get("prediction","NOTAVALUE"),
+                        "choice": obj.get("choice","NOTAVALUE"),
+                        "reasoning": obj.get("reasoning","NOTAVALUE"),
+                    })
+                except Exception:
+                    pass
+    return rows
+
+def append_checkpoint_row(row: dict):
+    with jsonlines.open(CHECKPOINT_JSONL, mode="a") as w:
+        w.write(row)
+    try:
+        f = open(CHECKPOINT_JSONL, "ab"); f.flush(); os.fsync(f.fileno()); f.close()
+    except Exception:
+        pass
+
+def predict_one(model: GPT5Model, agent: ToolAgent, q: dict) -> dict:
+    question = q.get("question", "")
+    options = q.get("options", [])
+
+    # PASS-1: plan
+    plan = model.plan(question, options)
+
+    # TOOLING
+    tool_facts_full, tool_trace = agent.collect(question, options, plan) if agent.ok else ("", [])
+
+    # CURATE
+    facts_for_model, used_tools_count, fams_used = select_success_facts_for_model(tool_facts_full, max_tools=10)
+
+    # PASS-2
+    prompt2 = model.build_pass2_prompt(question, options, plan, facts_for_model)
+    final = model.chat([{"role": "user", "content": prompt2}], max_tokens=120, temperature=0.0)
+
+    m = re.search(r"Final answer\s*:\s*([A-D])", final or "", re.I)
+    choice = (m.group(1).upper() if m else "NOTAVALUE")
+
+    # PREDICTION block: show ONLY the actual pass-2 input once + model output (no duplicated analysis/facts)
+    pred_lines = []
+    pred_lines.append("PASS-2 INPUT (TO MODEL):")
+    pred_lines.append(prompt2)
+    pred_lines.append("\nMODEL OUTPUT:")
+    pred_lines.append(final or "")
+    prediction_text = "\n".join(pred_lines)
+
+    # TRACE (reasoning): keep plan + tool runs + summary; omit the duplicated full pass-2 prompt
+    ok_calls = sum(1 for t in tool_trace if t.get("role")=="tool" and " | OK | " in (t.get("content") or ""))
+    fail_calls = sum(1 for t in tool_trace if t.get("role")=="tool" and " | FAILED | " in (t.get("content") or ""))
+    trace = []
+    trace.append({"role": "system", "content": "PASS1 plan"})
+    trace.append({"role": "assistant", "content": json.dumps(plan, ensure_ascii=False)})
+    trace.append({"role": "system", "content": f"TOOL RUN SUMMARY: successes sent to model={used_tools_count}; raw successes={ok_calls}; failures={fail_calls}; families_used={','.join(fams_used) if fams_used else 'None'}"})
+    for t in tool_trace:
+        trace.append(t)
+    # Omit the huge pass-2 prompt to avoid duplication; reference where it can be seen
+    trace.append({"role": "user", "content": "PASS-2 INPUT omitted here to avoid duplication. (See 'prediction' column for the exact prompt sent.)"})
+    trace.append({"role": "assistant", "content": final})
+
+    return {
+        "prediction": prediction_text or "NOTAVALUE",
+        "choice": choice if choice in list("ABCD") else "NOTAVALUE",
+        "reasoning": json.dumps(trace, ensure_ascii=False),
+        "used_tools_count": used_tools_count,
+        "families_used": fams_used,
+    }
+
+def run_pipeline(sample_size: int | None = 5, mode_label: str = "quick"):
+    test_file = locate_testset()
+    print(f"✅ Found testset: {test_file}")
+    questions = load_questions(test_file, limit=sample_size)
+
+    # --- checkpoint: skip already-done ids & preload previous rows ---
+    done_ids = load_done_ids_from_checkpoint()
+    prev_rows = load_rows_from_checkpoint()
+    if done_ids:
+        questions = [q for q in questions if str(q.get("id","")) not in done_ids]
+
+    model = GPT5Model(OR_MODEL_ID)
+    agent = ToolAgent()
+
+    rows = []
+    total_used_tools = 0
+    all_families_used: List[str] = []
+    for item in tqdm(questions, desc=f"Processing ({mode_label})"):
+        res = predict_one(model, agent, item)
+        total_used_tools += int(res.get("used_tools_count", 0))
+        all_families_used.extend(res.get("families_used", []))
+        row = {
+            "id": item.get("id", "NOTAVALUE"),
+            "prediction": res["prediction"],
+            "choice": res["choice"],
+            "reasoning": res["reasoning"],
+        }
+        rows.append(row)
+        # --- checkpoint: append this finished row immediately ---
+        append_checkpoint_row(row)
+
+    # merge previous rows + this run's rows (dedupe by id)
+    merged: Dict[str, dict] = {}
+    for r in prev_rows:
+        merged[str(r.get("id","NOTAVALUE"))] = r
+    for r in rows:
+        merged[str(r.get("id","NOTAVALUE"))] = r
+    all_rows = list(merged.values())
+
+    df = pd.DataFrame(all_rows)[["id", "prediction", "choice", "reasoning"]]
+    for col in ["id", "prediction", "choice", "reasoning"]:
+        df[col] = df[col].replace("", "NOTAVALUE").fillna("NOTAVALUE")
+
+    # save submission
+    csv_path = OUTPUT_ROOT / "submission.csv"
+    df.to_csv(csv_path, index=False)
+
+    # metadata
+    num_q = len(questions) if questions else 1
+    avg_tokens = round(model.avg_tokens_per_question(num_q), 2)
+    avg_tools_per_q = round((total_used_tools / float(num_q)) if num_q else 0.0, 2)
+    uniq_families = []
+    for fam in all_families_used:
+        if fam not in uniq_families:
+            uniq_families.append(fam)
+    tool_category_coverage = ", ".join(uniq_families) if uniq_families else ""
+
+    tools_counter = {}
+    for r in rows:
+        try:
+            tr = json.loads(r["reasoning"])
+            for msg in tr:
+                if msg.get("role") == "tool" and " | OK | " in (msg.get("content") or ""):
+                    name = msg.get("name") or ""
+                    tools_counter[name] = tools_counter.get(name, 0) + 1
+        except Exception:
+            pass
+
+    base_model_name = OR_MODEL_ID.split("/")[-1] if "/" in OR_MODEL_ID else OR_MODEL_ID
+    metadata = {
+        "meta_data": {
+            "model_name": base_model_name,
+            "track": "agentic_reasoning",
+            "model_type": "ChatGPTModel",
+            "base_model_type": "API",
+            "base_model_name": base_model_name,
+            "dataset": "cure_bench_testset_phrase_1",
+            "additional_info": "Zero-shot ChatGPT run",
+            "average_tokens_per_question": avg_tokens,
+            "average_tools_per_question": avg_tools_per_q,
+            "tool_category_coverage": tool_category_coverage,
+            "tools_used_counts": tools_counter,
+        }
+    }
+    meta_path = OUTPUT_ROOT / "metadata.json"
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    zip_path = OUTPUT_ROOT / f"cure_bench_gpt5_openrouter_{datetime.now():%Y%m%d_%H%M%S}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(csv_path, "submission.csv")
+        zf.write(meta_path, "metadata.json")
+
+    print(f"📦 Saved: {csv_path}")
+    print(f"📈 Saved: {meta_path}")
+    print(f"🗜️  Package: {zip_path}")
+
+
+if __name__ == "__main__":
+    # quick sanity run (adjust to None for full set)
+    #run_pipeline(sample_size=2, mode_label="quick")
+    # For the full competition run:
+    run_pipeline(sample_size=None, mode_label="competition")
